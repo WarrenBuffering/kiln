@@ -9,6 +9,20 @@ local function valid_win(win) return win and api.nvim_win_is_valid(win) end
 local function valid_buf(buf) return buf and api.nvim_buf_is_valid(buf) end
 local function active() return S.sessions[S.selected] end
 local function trim(s) return vim.trim(s or '') end
+-- Keep byte budgets without splitting a UTF-8 code point.
+local function continuation(byte) return byte and byte >= 128 and byte < 192 end
+local function text_prefix(text, limit)
+  if #text <= limit then return text end
+  local boundary = limit + 1
+  while boundary > 1 and continuation(text:byte(boundary)) do boundary = boundary - 1 end
+  return text:sub(1, boundary - 1)
+end
+local function text_suffix(text, limit)
+  if #text <= limit then return text end
+  local boundary = #text - limit + 1
+  while continuation(text:byte(boundary)) do boundary = boundary + 1 end
+  return text:sub(boundary)
+end
 local function display(s) return tostring(s or ''):gsub('\r', '\\r'):gsub('\n', '\\n') end
 local function lines(s) return vim.split(tostring(s or ''), '\n', { plain = true }) end
 local function notify(s, level) vim.notify(s, level or vim.log.levels.INFO, { title = 'Kiln' }) end
@@ -180,7 +194,10 @@ render = function()
         out[#out + 1] = ' ' .. body[j]
         S.event_rows[#out] = event
       end
-      if #body > 180 then out[#out + 1] = ' [Enter to inspect full output]' end
+      if #body > 180 then
+        out[#out + 1] = ' [Enter to inspect full output]'
+        S.event_rows[#out] = event
+      end
       out[#out + 1] = ''
       S.event_rows[#out] = event
       S.event_rows[marks[#marks][1]] = event
@@ -275,7 +292,7 @@ function M.provider(value)
     local event = previous.events[i]
     if event.type == 'message' then context[#context + 1] = (event.role or 'assistant') .. ': ' .. (event.text or '') end
   end
-  session.handoff = table.concat(context, '\n\n'):sub(-24000)
+  session.handoff = text_suffix(table.concat(context, '\n\n'), 24000)
   if session.handoff ~= '' then add(session, { type = 'notice', text = 'Handoff from ' .. previous.provider .. '. Recent conversation accompanies your next prompt. Native sessions remain separate.' }) end
   select_session(#S.sessions)
 end
@@ -390,7 +407,7 @@ function M.send()
       if line ~= '' then
         local ok, event = pcall(vim.json.decode, line)
         if ok and type(event) == 'table' then event_received(session, event)
-        else add(session, { type = 'error', text = 'Invalid provider event: ' .. line:sub(1, 500) }) end
+        else add(session, { type = 'error', text = 'Invalid provider event: ' .. text_prefix(line, 500) }) end
       end
     end
   end
@@ -399,7 +416,7 @@ function M.send()
   local job = fn.jobstart(command, {
     cwd = S.root,
     on_stdout = function(_, data) consume(data) end,
-    on_stderr = function(_, data) stderr = (stderr .. table.concat(data or {}, '\n')):sub(-10000) end,
+    on_stderr = function(_, data) stderr = text_suffix(stderr .. table.concat(data or {}, '\n'), 10000) end,
     on_exit = function(_, code_exit)
       if partial ~= '' then consume({ '', '' }) end
       session.job = nil
@@ -415,7 +432,7 @@ function M.send()
   })
   if job <= 0 then session.status = 'error'; notify('Could not start provider bridge.', vim.log.levels.ERROR); return end
   session.job = job
-  session.title = prompt:gsub('\n', ' '):sub(1, 70)
+  session.title = text_prefix(prompt:gsub('\n', ' '), 70)
   add(session, { type = 'message', role = 'user', text = prompt, id = 'user-' .. uv.hrtime() })
   session.draft, session.handoff = '', nil
   api.nvim_buf_set_lines(S.buffers.prompt, 0, -1, false, { '' })

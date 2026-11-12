@@ -55,6 +55,9 @@ emit({"type": "session", "id": "test-native-session"})
 emit({"type": "message", "id": "message-1", "role": "assistant", "text": "First"})
 if "slow fixture" in prompt:
     time.sleep(30)
+if "long output fixture" in prompt:
+    emit({"type": "tool", "id": "long-tool", "name": "Shell", "status": "done",
+          "text": "\n".join("tool output line " + str(i) for i in range(1, 206))})
 emit({"type": "message", "id": "message-1", "role": "assistant", "text": "First response completed"})
 emit({"type": "usage", "input_tokens": 11, "output_tokens": 7})
 emit({"type": "done", "ok": True, "exit_code": 0}, False)
@@ -220,6 +223,24 @@ emit({"type": "done", "ok": True, "exit_code": 0}, False)
   for _, map in ipairs(transcript_maps) do if map.lhs == 'e' then mapped_e = true end end
   check(not mapped_e, 'native Vim word-end motion e is retained')
   check(fn.filereadable(s.state_file) == 1, 'sessions persist to isolated state directory')
+  vim.cmd('KilnModel default')
+  api.nvim_buf_set_lines(s.buffers.prompt, 0, -1, false, { 'long output fixture' })
+  app.send()
+  check(vim.wait(5000, function() return active.job == nil end, 20), 'long tool output turn completes')
+  app.follow() -- Render the completed fixture before using its visible action.
+  local marker
+  for row, line in ipairs(api.nvim_buf_get_lines(s.buffers.transcript, 0, -1, false)) do
+    if line == ' [Enter to inspect full output]' then marker = row; break end
+  end
+  check(marker ~= nil, 'long output displays the inspection marker')
+  api.nvim_set_current_win(s.windows.transcript)
+  api.nvim_win_set_cursor(s.windows.transcript, { marker, 0 })
+  fn.maparg('<CR>', 'n', false, true).callback()
+  check(api.nvim_get_current_win() ~= s.windows.transcript, 'Enter on the marker opens the full-output viewer')
+  local full_output = api.nvim_buf_get_lines(0, 0, -1, false)
+  equal(#full_output, 205, 'full-output viewer contains every line beyond the preview limit')
+  equal(full_output[205], 'tool output line 205', 'last omitted preview line is accessible in the viewer')
+  fn.maparg('q', 'n', false, true).callback()
   vim.o.columns, vim.o.lines = 80, 24
   api.nvim_exec_autocmds('VimResized', {})
   equal(api.nvim_win_get_width(s.windows.monitor), 24, 'narrow terminal retains minimum sidebar width')

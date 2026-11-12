@@ -246,6 +246,26 @@ else:
     'Closing deletion diff opens a fresh buffer instead of reopening the missing file')
   check(fn.bufnr(root .. '/app.py') >= 0, 'Original deleted-file buffer stays available in buffer history')
   check(not contains(fn.execute('messages'), 'E211'), 'Deletion lifecycle does not emit a missing-file error')
+
+  -- Both provider handoff directions must survive a byte limit inside Unicode.
+  for _, case in ipairs({ { provider = 'claude', char = 'é', count = 12000 },
+    { provider = 'codex', char = '😀', count = 6000 } }) do
+    local previous = state.sessions[state.selected]
+    previous.events = { { type = 'message', role = 'assistant', text = string.rep(case.char, case.count) .. 'a' } }
+    app.provider(case.provider)
+    local next_session = state.sessions[state.selected]
+    local expected = string.rep(case.char, case.count - 1) .. 'a'
+    check(next_session.handoff == expected, case.provider .. ' handoff truncation preserves complete Unicode characters')
+    local prompt = string.rep('x', 69) .. '😀 Continue the Unicode handoff'
+    api.nvim_buf_set_lines(state.buffers.prompt, 0, -1, false, { prompt })
+    app.send()
+    check(next_session.title == string.rep('x', 69), 'Session title ends before a partially fitting emoji')
+    wait_for(function() return next_session.job == nil end, case.provider .. ' Unicode handoff completes through the real bridge')
+    check(next_session.status == 'done', case.provider .. ' accepts Unicode handoff without an encoding failure')
+    local sent = requests(case.provider)
+    check(contains(sent[#sent].prompt, expected) and contains(sent[#sent].prompt, prompt),
+      case.provider .. ' receives both the intact Unicode history and complete new prompt')
+  end
   check(#warnings == 0, 'Full streaming lifecycle emits no UI warnings: ' .. table.concat(warnings, '\n'))
 end
 

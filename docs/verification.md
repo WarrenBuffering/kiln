@@ -16,9 +16,9 @@ The installed `kiln` shortcut resolves to this checkout. `kiln --doctor` confirm
 
 Run `make test` from the checkout. Tests use temporary Git repositories, executable provider doubles, and real headless Neovim processes. No model requests are submitted.
 
-The final run passed 68 Python tests and 186 Neovim assertions: 54 live-change assertions, 56 provider-streaming assertions, and 76 workspace UI assertions. The local run log is retained under `.state/verification.log`.
+The latest run passed 68 Python tests and 201 Neovim assertions: 54 live-change assertions, 66 provider-streaming assertions, and 81 workspace UI assertions. The latest local run log is retained under `.state/verification-audit.log`; the initial verification log remains under `.state/verification.log`.
 
-The suite covers provider event normalization; fragmented streams; native session continuation; provider handoffs; subagent activity; account isolation; permission denials; literal argument handling; terminal restoration; editor layout; multiline drafts; live diffs; deleted, renamed, and untracked files; unusual filenames; symlinked buffer paths; preservation of unsaved edits; and native error diagnostics.
+The suite covers provider event normalization; fragmented streams; native session continuation; Unicode provider handoffs; subagent activity; full tool-output navigation; account isolation; permission denials; literal argument handling; terminal restoration; editor layout; multiline drafts; live diffs; deleted, renamed, and untracked files; unusual filenames; symlinked buffer paths; preservation of unsaved edits; and native error diagnostics.
 
 End-to-end cases run the actual Neovim interface through the Python bridge into fake Codex and Claude executables, change files on disk, and inspect the resulting editor buffers. Cancellation cases run stubborn provider and child processes under Neovim's real `jobstop()` lifecycle and verify that they are gone before its forced-kill deadline.
 
