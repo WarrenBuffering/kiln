@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+"""Launch an isolated Kiln workspace without changing the user's editor config."""
+
+import argparse
+from contextlib import contextmanager
+import fcntl
+import hashlib
+import os
+from pathlib import Path
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import termios
+
+
+class WorkspaceInUseError(RuntimeError):
+    """Another launcher owns this project's persisted session state."""
+
+
+@contextmanager
+def project_lock(state, root):
+    """Hold a kernel-managed lock across the editor's complete lifetime."""
+    directory = Path(state) / "locks"
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    identity = hashlib.sha256(str(Path(root).resolve()).encode("utf-8")).hexdigest()
+    descriptor = os.open(directory / (identity + ".lock"), os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise WorkspaceInUseError(
+                "Kiln is already open for this project; switch sessions in the existing workspace"
+            ) from exc
+        yield
+    finally:
+        # Closing the descriptor releases ownership, including after exceptions.
+        # Keep the empty lock file: unlinking it would permit an inode race.
+        os.close(descriptor)
+
+
+def run_editor(command, env, root):
+    """Give Ctrl-S to Neovim and restore the caller's terminal on every exit."""
+    terminal, original = None, None
+    process = None
+    handlers = {}
+    try:
+        if sys.stdin.isatty():
+            terminal = sys.stdin.fileno()
+            original = termios.tcgetattr(terminal)
+            settings = list(original)
+            settings[0] &= ~termios.IXON
+            termios.tcsetattr(terminal, termios.TCSANOW, settings)
+        process = subprocess.Popen(command, env=env, cwd=root)
+        # The terminal delivers Ctrl-C to Neovim as well as this wrapper.
+        # Let Neovim handle it without Python interrupting its wait.
+        handlers[signal.SIGINT] = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        handlers[signal.SIGTERM] = signal.signal(signal.SIGTERM, lambda signum, _frame: process.send_signal(signum))
+        result = process.wait()
+        return result if result >= 0 else 128 - result
+    finally:
+        for signum, handler in handlers.items():
+            signal.signal(signum, handler)
+        if original is not None:
+            try:
+                termios.tcsetattr(terminal, termios.TCSANOW, original)
+            except (OSError, termios.error):
+                # A disconnected terminal cannot be restored.
+                pass
+
+
+def version(command):
+    try:
+        result = subprocess.run(
+            [command, "--version"], capture_output=True, text=True, timeout=10
+        )
+        return (result.stdout or result.stderr).splitlines()[0]
+    except (OSError, subprocess.TimeoutExpired, IndexError):
+        return "version unavailable"
+
+
+def account_tools(home):
+    """Import the same profile logic used by the provider bridge."""
+    sys.path.insert(0, str(home / "python"))
+    import accounts
+    return accounts
+
+
+def show_accounts(home, state):
+    accounts = account_tools(home)
+    try:
+        profile = accounts.load_profile(state_dir=str(state))
+        env = accounts.provider_environment(state_dir=str(state))
+    except accounts.AccountError as exc:
+        print(f"Account configuration: {exc}", file=sys.stderr)
+        return 1
+    print("KILN / provider accounts")
+    if profile.get("expected_email"):
+        print(f"  Expected: {profile['expected_email']}")
+    ready = True
+    for provider in ("codex", "claude"):
+        try:
+            info = accounts.check_account(provider, profile=profile, env=env)
+            matched = info.get("matches") is not False
+            authenticated = info.get("authenticated", False)
+            status = "ready" if authenticated and matched else ("wrong account" if authenticated else "not signed in")
+            print(f"  {provider:6} {status}: {info.get('email') or 'email unavailable'}")
+            print(f"         Profile: {info.get('config_dir', 'CLI default')}")
+            ready = ready and authenticated and matched
+        except accounts.AccountError as exc:
+            print(f"  {provider:6} {exc}")
+            ready = False
+    return 0 if ready else 1
+
+
+def login_provider(home, state, provider, executable):
+    accounts = account_tools(home)
+    try:
+        profile = accounts.load_profile(state_dir=str(state))
+        env = accounts.provider_environment(state_dir=str(state))
+        configured_home = profile.get("claude_config_dir" if provider == "claude" else "codex_home")
+        if configured_home:
+            Path(configured_home).mkdir(parents=True, exist_ok=True, mode=0o700)
+        if provider == "claude":
+            command = [executable, "auth", "login", "--claudeai"]
+            if profile.get("expected_email"):
+                command.extend(["--email", profile["expected_email"]])
+        else:
+            command = [executable, "login", "--device-auth"]
+        print(f"Opening {provider}'s login for {configured_home or 'its default CLI profile'}.", flush=True)
+        if profile.get("expected_email"):
+            print(f"Use {profile['expected_email']} to sign in.", flush=True)
+        result = subprocess.run(command, env=env, check=False)
+        if result.returncode:
+            return result.returncode
+        info = accounts.check_account(provider, profile=profile, env=env)
+        if not info.get("authenticated") or info.get("matches") is False:
+            print("Login did not select the configured account. Run kiln --accounts to inspect it.", file=sys.stderr)
+            return 1
+        print(f"{provider} is ready: {info.get('email') or 'authenticated'}")
+        return 0
+    except (accounts.AccountError, OSError) as exc:
+        print(f"Could not sign in to {provider}: {exc}", file=sys.stderr)
+        return 1
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="kiln",
+        description="A code-first agent workspace: Neovim, Codex, and Claude.",
+        epilog="No agent starts until you submit a prompt. --demo is offline.",
+    )
+    action = parser.add_mutually_exclusive_group()
+    action.add_argument("--demo", action="store_true", help="open the offline demonstration")
+    action.add_argument("--doctor", action="store_true", help="check local dependencies and exit")
+    action.add_argument("--accounts", action="store_true", help="show selected provider account metadata and exit")
+    action.add_argument("--login", choices=("codex", "claude"), help="sign in to a provider's configured profile")
+    parser.add_argument("directory", nargs="?", default=".", help="project directory (default: current directory)")
+    parser.add_argument("file", nargs="?", help="file to open, relative to the project directory")
+    args = parser.parse_args()
+    home = Path(__file__).resolve().parent.parent
+    state = Path(os.environ.get("KILN_STATE_DIR", str(home / ".state"))).expanduser().resolve()
+    required = ("nvim", "python3", "git")
+    optional = ("codex", "claude")
+    resolved = {name: shutil.which(name) for name in required + optional}
+
+    if args.accounts:
+        return show_accounts(home, state)
+    if args.login:
+        if not resolved[args.login]:
+            parser.error(f"{args.login} is not installed or is not on PATH")
+        return login_provider(home, state, args.login, resolved[args.login])
+
+    if args.doctor:
+        print("KILN / local environment")
+        for name in required + optional:
+            path = resolved[name]
+            label = "required" if name in required else "provider"
+            print(f"  {'OK' if path else '--':2} {name:8} {version(path) if path else 'not found'} ({label})")
+        print(f"  Source: {home}")
+        print("  Accounts: run kiln --accounts to check configured profiles; no credentials are copied.")
+        if resolved["nvim"] and not supported_neovim(resolved["nvim"]):
+            print("  ERROR: Neovim 0.10 or newer is required.")
+            return 1
+        return 0 if all(resolved[name] for name in required) else 1
+
+    missing = [name for name in required if not resolved[name]]
+    if missing:
+        parser.error("missing required tools: " + ", ".join(missing) + "; run kiln --doctor")
+    if not supported_neovim(resolved["nvim"]):
+        parser.error("Neovim 0.10 or newer is required")
+    root = Path(args.directory).expanduser().resolve()
+    if not root.is_dir():
+        parser.error(f"not a directory: {root}")
+    try:
+        state.mkdir(parents=True, exist_ok=True, mode=0o700)
+        state.chmod(0o700)
+        for name in ("cache", "data", "state", "config"):
+            (state / name).mkdir(exist_ok=True, mode=0o700)
+    except OSError as exc:
+        parser.error(f"cannot create state directory {state}: {exc}")
+    env = os.environ.copy()
+    env.update({
+        "KILN_HOME": str(home),
+        "KILN_ROOT": str(root),
+        "KILN_STATE_DIR": str(state),
+        "KILN_DEMO": "1" if args.demo else "0",
+        "NVIM_APPNAME": "kiln",
+        "XDG_CACHE_HOME": str(state / "cache"),
+        "XDG_DATA_HOME": str(state / "data"),
+        "XDG_STATE_HOME": str(state / "state"),
+        "XDG_CONFIG_HOME": str(state / "config"),
+    })
+    # Save the original XDG environment so provider subprocesses can restore it.
+    # Otherwise isolating Neovim could accidentally select a different CLI login.
+    for name in ("XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CONFIG_HOME"):
+        env["KILN_ORIGINAL_" + name] = os.environ.get(name, "")
+    command = [resolved["nvim"], "-u", str(home / "init.lua"), "-i", "NONE"]
+    if args.file:
+        command.extend(["--", args.file])
+    try:
+        if args.demo:
+            return run_editor(command, env, str(root))
+        with project_lock(state, root):
+            return run_editor(command, env, str(root))
+    except WorkspaceInUseError as exc:
+        parser.error(str(exc))
+    except OSError as exc:
+        parser.error(f"could not start Neovim: {exc}")
+
+
+def supported_neovim(command):
+    match = re.search(r"NVIM v(\d+)\.(\d+)", version(command))
+    return bool(match and tuple(map(int, match.groups())) >= (0, 10))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
