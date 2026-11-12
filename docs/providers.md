@@ -13,3 +13,5 @@ The local implementation was developed against Codex CLI 0.160.1, Claude Code 2.
 Native provider output is not identical. Codex generally reports assistant text at item boundaries; Claude can emit text deltas. Tool and file activity can appear before a complete assistant message. Kiln renders the events it receives without inventing progress or extrapolating account balances from token counts.
 
 Model names are account dependent. Kiln leaves default selection to the CLI and permits explicit model names. A failed model selection should appear as an error in the transcript so the user can choose another model.
+
+To reuse existing logins, leave profile-directory overrides unset. On the tested macOS Claude installation, explicitly setting `CLAUDE_CONFIG_DIR` to the normal directory selected a different authentication namespace from leaving it unset. A matching filesystem path therefore does not prove that two invocations share the same keychain login; `kiln --accounts` verifies the selected identity directly.

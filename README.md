@@ -76,25 +76,25 @@ An edit agent owns the workspace while it runs. Use plan mode for parallel revie
 
 One Kiln window owns a project's saved sessions at a time. A second launch for the same project and state directory asks you to use sessions in the existing workspace, preventing concurrent history writes and competing editing agents. Different projects can run simultaneously; offline demos are exempt.
 
-Inspect the selected accounts or explicitly start a provider's login flow:
+Kiln normally reuses the accounts already signed in to the installed CLIs. A separate login is not required. Inspect the selected accounts with:
 
 ```sh
 kiln --accounts
-kiln --login claude
-kiln --login codex
 ```
 
-Account separation is configured locally in `$KILN_STATE_DIR/providers.json`, or `.state/providers.json` when the state directory is not overridden:
+To require a particular personal account while keeping those existing sessions, configure `$KILN_STATE_DIR/providers.json`, or `.state/providers.json` when the state directory is not overridden:
 
 ```json
 {
-  "expected_email": "you@example.com",
-  "claude_config_dir": "/absolute/path/to/private/claude-profile",
-  "codex_home": "/absolute/path/to/private/codex-profile"
+  "expected_email": "you@example.com"
 }
 ```
 
-The profile paths are optional. A configured path selects that isolated CLI profile without changing the default profile or copying its credentials. When `expected_email` is set, streamed and native agent sessions require that account. A missing or different account is reported before the agent starts. Without a local profile, Kiln uses the normal CLI configuration.
+When `expected_email` is set, streamed and native agent sessions require that account. A missing or different account is reported before the agent starts. Without a local profile, Kiln uses the normal CLI configuration.
+
+If you deliberately want separate logins, add optional `claude_config_dir` and `codex_home` fields with absolute profile-directory paths. These select isolated CLI profiles without changing the defaults or copying credentials. Omit those fields to reuse the normal CLI logins.
+
+Only when the selected profile needs a login, run `kiln --login claude` or `kiln --login codex`.
 
 `--login` runs only when explicitly requested. Claude's subscription login receives the expected email when configured. Codex uses device authorization; open its displayed link in the browser profile you intend to use. The selected account is checked again after login.
 

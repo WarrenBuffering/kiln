@@ -28,6 +28,19 @@ The offline workspace was inspected in detached 180×52 and 160×46 terminals. S
 
 ## Validation boundary
 
-Installed CLI flags were checked against local help and official provider documentation. Authentication checks used account metadata only. Live model generation has not been exercised; the configured isolated profiles await approved-account sign-in.
+Installed CLI flags were checked against local help and official provider documentation. Both existing personal CLI logins were verified against the account explicitly authorized by the user. Kiln now reuses those sessions with an email check; separate authentication is optional.
 
-The existing provider logins and normal Neovim configuration were left intact. No deployment, push, public posting, or paid model call was performed. Linux portability has not been exercised on a Linux host.
+Four live turns then passed through the real Neovim UI and Python bridge in a disposable Git fixture:
+
+| Provider | Selected model | Verified behavior |
+| --- | --- | --- |
+| Codex | `gpt-6-astra` | File edit, continuation using the same native session, tool/file events, assistant updates, live diff |
+| Claude | `sonnet` | Provider handoff, file edit, continuation using the same native session, incremental text, tool/file events, live diff |
+
+Each turn completed successfully with the requested disk content displayed in the code buffer. The sidebar width and prompt focus were preserved. Both resumed turns retained their original provider session IDs. Normalized transcripts and results are retained under `.state/live-verification/`.
+
+Narration timing depends on provider behavior: assistant updates arrived before the edit in three of the four turns. Claude's initial turn exposed Read/Edit activity before the file change and narrated its result afterward. This check does not establish that every provider turn will produce explanatory text before every edit. Existing Codex plugin configuration also emitted unrelated Notion authentication diagnostics; the coding turns still completed successfully.
+
+The probe's `visible_narration_before_disk` field samples only when an event arrives, before the deferred UI refresh. It does not measure when rendered narration becomes visible and is not used as evidence of screen timing.
+
+The existing provider logins and normal Neovim configuration were left intact. No deployment, push, public posting, package installation, or API-key purchase was performed. The live checks used the authorized personal subscription sessions. Linux portability has not been exercised on a Linux host.
