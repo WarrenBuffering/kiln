@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import codecs
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -20,6 +21,7 @@ import time
 from typing import Any, Callable
 
 from accounts import enforce_account, provider_environment
+from leases import writer_lock
 
 
 INSTRUCTIONS = """You are working in Kiln, a live Neovim coding workspace.
@@ -374,12 +376,15 @@ class JsonLines:
             raise ValueError("Provider output exceeded the 16 MiB JSON line limit")
 
 
+
+
 def run(args: argparse.Namespace, prompt: str, emit: Callable[[dict], None]) -> int:
     normalizer = Normalizer(args.provider, emit)
     process = None
     stopped_at = None
     old_handlers = {}
     stderr_tail: list[str] = []
+    leases = contextlib.ExitStack()
 
     def stop(signum: int, _frame: Any) -> None:
         nonlocal stopped_at
@@ -413,6 +418,7 @@ def run(args: argparse.Namespace, prompt: str, emit: Callable[[dict], None]) -> 
             raise ValueError(f"Workspace does not exist: {args.cwd}")
         if not prompt.strip():
             raise ValueError("Prompt is empty")
+        leases.enter_context(writer_lock(args.cwd, args.mode))
         environment = provider_environment()
         enforce_account(args.provider, env=environment)
         if stopped_at is not None:
@@ -508,6 +514,7 @@ def run(args: argparse.Namespace, prompt: str, emit: Callable[[dict], None]) -> 
             for pipe in (process.stdin, process.stdout, process.stderr):
                 if pipe is not None and not pipe.closed:
                     pipe.close()
+        leases.close()
         for sig, handler in old_handlers.items():
             signal.signal(sig, handler)
     ok = exit_code == 0 and normalizer.completed and not normalizer.failed and not normalizer.blocked
@@ -530,10 +537,11 @@ def main() -> int:
     if args.interactive:
         try:
             command = build_interactive_command(args.provider, args.cwd, args.model, args.session, args.mode)
-            environment = provider_environment()
-            enforce_account(args.provider, env=environment)
-            os.chdir(args.cwd)
-            os.execvpe(command[0], command, environment)
+            with writer_lock(args.cwd, args.mode, inherit=True):
+                environment = provider_environment()
+                enforce_account(args.provider, env=environment)
+                os.chdir(args.cwd)
+                os.execvpe(command[0], command, environment)
         except (OSError, ValueError) as error:
             print(f"Kiln: {error}", file=sys.stderr)
             return 1

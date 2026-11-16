@@ -36,6 +36,12 @@ function M.setup()
     KilnError = { fg = c.red }, KilnTool = { fg = c.blue }, KilnBorder = { fg = "#34434B" },
     KilnPanel = { fg = c.fg, bg = c.panel }, KilnUser = { fg = c.amber, bold = true },
     KilnAgent = { fg = c.cyan, bold = true }, KilnRunning = { fg = c.amber },
+    KilnCurrent = { fg = c.amber, bg = '#303126', bold = true },
+    KilnEditAdd = { bg = '#284A36' }, KilnEditChange = { bg = '#345360' },
+    KilnEditDelete = { fg = c.red, bg = '#4A2D30' },
+    KilnEditAddQuiet = { fg = c.dim, bg = '#18231D' },
+    KilnEditChangeQuiet = { fg = c.dim, bg = '#1B252B' },
+    KilnEditDeleteQuiet = { fg = '#A77773', bg = '#271D20' },
   }
   for name, value in pairs(groups) do vim.api.nvim_set_hl(0, name, value) end
 end

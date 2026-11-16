@@ -1,0 +1,156 @@
+-- Evidence uses observed command results and definition-scoped file events.
+vim.opt.runtimepath:prepend(vim.env.KILN_HOME or vim.fn.getcwd())
+local e = require('kiln.evidence')
+local count = 0
+local function check(value, message) count = count + 1; assert(value, message) end
+local function equal(actual, expected, message)
+  check(vim.deep_equal(actual, expected), message .. '\n' .. vim.inspect(actual) .. '\n' .. vim.inspect(expected))
+end
+local function session()
+  return { root = '/workspace', workflow = { current = 'admit', steps = {
+    admit = { fingerprint = 'v1', status = 'running' }, report = { fingerprint = 'r1', status = 'pending' },
+  } } }
+end
+local function run()
+  local s = session()
+  local function event(value, step)
+    value.step_id, value.turn_id = step or 'admit', value.turn_id or 'turn1'
+    e.observe(s, value)
+  end
+  event({ type = 'message', role = 'assistant', text = '99 tests passed' })
+  equal(e.summary(s, 'admit').tests_passed, 0, 'Assistant claims never become check evidence')
+  event({ type = 'file', path = '/workspace/lib/queue.ex', action = 'update' })
+  event({ type = 'file', path = 'lib/queue.ex', action = 'update' })
+  event({ type = 'file', path = '/other/secrets' })
+  event({ type = 'file', path = '../secrets' })
+  event({ type = 'file', path = 'bad\nname' })
+  equal(#e.summary(s, 'admit').files, 1, 'File events deduplicate and reject outside/control-character paths')
+  equal(e.summary(s, 'admit').files[1].path, 'lib/queue.ex', 'Absolute paths are scoped to the workspace')
+  event({ type = 'tool', name = 'Shell', id = 'c1', status = 'running', text = "/bin/zsh -lc 'elixir scheduler_test.exs'" })
+  equal(e.summary(s, 'admit').checks_running, 1, 'A real test tool can show running checks')
+  equal(e.action(s), 'Running checks', 'Current action comes from the actual running command')
+  event({ type = 'tool', name = 'Shell', id = 'c1', status = 'done',
+    text = "/bin/zsh -lc 'elixir scheduler_test.exs'\n6 tests, 0 failures\n[exit 0]" })
+  local summary = e.summary(s, 'admit')
+  equal(summary.tests_passed, 6, 'ExUnit passing total is parsed from tool output')
+  equal(summary.checks_running, 0, 'Tool completion replaces its running snapshot')
+  equal(#summary.checks, 1, 'Streaming tool snapshots do not duplicate a check')
+  event({ type = 'tool', name = 'Bash', id = 'c2', status = 'error',
+    text = '{"command":"elixir scheduler_test.exs"}\n6 tests, 1 failure' })
+  summary = e.summary(s, 'admit')
+  equal(summary.tests_passed, 0, 'A failed retry invalidates the earlier successful check')
+  equal(summary.tests_failed, 1, 'Singular ExUnit failure is parsed')
+  equal(summary.checks_failed, 1, 'Claude and Codex wrapper forms share command identity')
+  equal(#summary.unresolved, 1, 'An actual failed check is unresolved')
+  event({ type = 'tool', name = 'Bash', id = 'c3', status = 'done',
+    text = '{"command":"elixir scheduler_test.exs"}\n6 tests, 0 failures' })
+  summary = e.summary(s, 'admit')
+  equal(summary.tests_passed, 6, 'A successful real retry resolves the failed check')
+  equal(summary.checks_failed, 0, 'Failed retries do not remain falsely active')
+  equal(#summary.unresolved, 0, 'Retry clears the failure for that command')
+  event({ type = 'tool', name = 'Shell', status = 'done', id = 'read', text = 'cat README.md\n42 tests, 0 failures\n[exit 0]' })
+  equal(e.summary(s, 'admit').tests_passed, 6, 'Reading a fixture or documentation does not prove tests ran')
+  event({ type = 'tool', name = 'Shell', id = 'py', status = 'done', text = 'pytest -q\n===== 4 passed in 0.2s =====\n[exit 0]' })
+  equal(e.summary(s, 'admit').tests_passed, 10, 'Pytest summary is added to distinct check evidence')
+  event({ type = 'tool', name = 'Shell', id = 'js', status = 'done', text = 'npm test\nTests:       2 passed, 2 total\n[exit 0]' })
+  equal(e.summary(s, 'admit').tests_passed, 12, 'Jest actual summary is counted')
+  event({ type = 'tool', name = 'Shell', id = 'rust', status = 'done', text = 'cargo test\ntest result: ok. 3 passed; 0 failed; 0 ignored\n[exit 0]' })
+  equal(e.summary(s, 'admit').tests_passed, 15, 'Rust actual summary is counted')
+  event({ type = 'tool', name = 'Shell', id = 'demo', status = 'done', text = 'elixir demo.exs\nGO: 2\n[exit 0]' })
+  summary = e.summary(s, 'admit')
+  equal(summary.tests_passed, 15, 'Successful demo does not invent a test count')
+  equal(summary.checks_passed, 5, 'Successful demo remains an observed passed check')
+  event({ type = 'tool', name = 'Shell', id = 'nonzero', status = 'done', text = 'go test ./...\n[exit 1]' })
+  equal(e.summary(s, 'admit').checks_failed, 1, 'Nonzero real exit overrides an inconsistent done status')
+  event({ type = 'error', text = 'Provider disconnected' })
+  event({ type = 'tool', name = 'Shell', id = 'interrupted', status = 'running', text = 'mix test' })
+  e.finish(s, 'admit', false)
+  summary = e.summary(s, 'admit')
+  equal(summary.checks_running, 0, 'Interrupted commands do not stay running')
+  check(table.concat(summary.unresolved, '\n'):find('Not finished: mix test', 1, true), 'Interrupted checks remain explicitly unverified')
+  check(table.concat(summary.unresolved, '\n'):find('Provider disconnected', 1, true), 'Failed-turn errors remain visible')
+  e.finish(s, 'admit', true)
+  summary = e.summary(s, 'admit')
+  check(not table.concat(summary.unresolved, '\n'):find('Provider disconnected', 1, true), 'A successful retry clears generic provider blockers')
+  equal(summary.checks_failed, 1, 'A completed turn never turns a failed check green')
+  event({ type = 'file', path = 'board.ex' }, 'report')
+  event({ type = 'tool', name = 'Shell', id = 'retest', status = 'done', text = 'elixir scheduler_test.exs\n7 tests, 0 failures\n[exit 0]' }, 'report')
+  local plan = { steps = { { id = 'admit', title = 'Admission' }, { id = 'report', title = 'Report' } } }
+  local review = e.review(s, plan)
+  equal(#review.groups, 2, 'Review preserves outcome grouping')
+  equal(#review.files, 2, 'Review deduplicates changed files across steps')
+  equal(review.tests_passed, 16, 'Review counts the newest scheduler rerun once across steps')
+  equal(review.groups[1].tests_passed, 15, 'Per-step evidence still describes that step own commands')
+  equal(review.groups[2].files[1].path, 'board.ex', 'File review belongs to its actual step')
+  s.workflow.steps.admit.fingerprint = 'v2'
+  equal(#e.summary(s, 'admit').files, 0, 'Revised outcome cannot show stale files or checks as current evidence')
+  equal(e.review(s, plan).tests_passed, 7, 'Review ignores obsolete definition evidence')
+  event({ type = 'file', path = 'stale.ex', step_fingerprint = 'v1' })
+  equal(#e.summary(s, 'admit').files, 0, 'Late events from previous definition cannot contaminate evidence')
+  event({ type = 'file', path = 'revised.ex', step_fingerprint = 'v2' })
+  equal(e.summary(s, 'admit').files[1].path, 'revised.ex', 'New definition starts a fresh evidence record')
+  e.reset(s, 'admit', 'v2')
+  equal(#e.summary(s, 'admit').files, 0, 'Explicit reset clears same-fingerprint invalidation')
+  event({ type = 'tool', name = 'Read', id = 'badread', status = 'error', path = '/workspace/missing.ex', text = 'Not found' })
+  check(table.concat(e.summary(s, 'admit').unresolved, '\n'):find('Failed: Read missing.ex', 1, true), 'Failed read tools stay visible even without a separate provider error')
+  event({ type = 'tool', name = 'Read', id = 'retryread', status = 'done', path = '/workspace/missing.ex', text = 'Now exists' })
+  equal(#e.summary(s, 'admit').unresolved, 0, 'Successful retry resolves the same file tool operation')
+  event({ type = 'human', path = 'order.ex', text = 'Saved manual comparator' })
+  equal(e.summary(s, 'admit').files[1].actor, 'human', 'Saved human files remain in the outcome review')
+  s.turn_id = 'next-turn'
+  equal(e.action(s), 'Waiting for provider', 'Old step activity cannot impersonate a newly started turn')
+  s.events = { { type = 'tool', name = 'Read', path = '/workspace/plan.ex', status = 'running', turn_id = 'next-turn' } }
+  s.workflow.current = nil
+  equal(e.action(s), 'Reading plan.ex', 'Planning shows observed read activity without a dossier step')
+  s.events[1].status = 'done'
+  equal(e.action(s), 'Waiting for provider', 'Completed reads do not stay falsely active')
+  local quiet = session()
+  e.observe(quiet, { type = 'tool', name = 'Shell', id = 'quiet', step_id = 'admit', status = 'done',
+    text = 'pytest -q\n.... [100%]\n4 passed in 0.2s\n[exit 0]' })
+  equal(e.summary(quiet, 'admit').tests_passed, 4, 'Quiet pytest summary without banners is recognized')
+  e.observe(quiet, { type = 'tool', name = 'Shell', id = 'multi', step_id = 'report', status = 'done',
+    text = 'elixir a_test.exs && elixir b_test.exs\n6 tests, 0 failures\n5 tests, 0 failures\n[exit 0]' })
+  equal(e.summary(quiet, 'report').tests_passed, 11, 'Distinct suite summaries in one check preserve both observed totals')
+  e.observe(quiet, { type = 'file', path = 'queue.ex', step_id = 'admit' })
+  equal(e.summary(quiet, 'admit').tests_passed, 0, 'A later source edit invalidates earlier passing evidence for this step')
+  equal(e.summary(quiet, 'admit').checks_stale, 1, 'Stale check remains inspectable and explicitly needs a rerun')
+  equal(e.summary(quiet, 'report').tests_passed, 11, 'Unrelated outcome edits do not erase another outcome results')
+  e.observe(quiet, { type = 'human', path = 'shared.ex', step_id = 'admit' })
+  equal(e.summary(quiet, 'report').tests_passed, 0, 'Unknown human dependency conservatively invalidates all checks')
+  e.observe(quiet, { type = 'tool', name = 'Shell', id = 'rerun', step_id = 'admit', status = 'running', text = 'pytest -q' })
+  e.observe(quiet, { type = 'file', path = 'queue.ex', step_id = 'admit' })
+  e.observe(quiet, { type = 'tool', name = 'Shell', id = 'rerun', step_id = 'admit', status = 'done', text = 'pytest -q\n4 passed in 0.2s\n[exit 0]' })
+  equal(e.summary(quiet, 'admit').tests_passed, 0, 'Edit during a running check cannot make its later result current')
+  e.observe(quiet, { type = 'tool', name = 'Shell', id = 'fresh', step_id = 'admit', status = 'done', text = 'pytest -q\n4 passed in 0.2s\n[exit 0]' })
+  equal(e.summary(quiet, 'admit').tests_passed, 4, 'A new actual check after edits restores current verification')
+  quiet.workflow.phase, quiet.workflow.current = 'review', nil
+  e.observe(quiet, { type = 'human', path = 'queue.ex' })
+  equal(e.summary(quiet, 'admit').tests_passed, 0, 'Human save after completion invalidates old checks without a current step')
+  e.observe(quiet, { type = 'tool', name = 'Shell', id = 'finalcheck', step_id = 'admit', status = 'done', text = 'pytest -q\n4 passed in 0.2s\n[exit 0]' })
+  e.observe(quiet, { type = 'human', path = 'new_shared.ex' })
+  equal(e.summary(quiet, 'admit').tests_passed, 0, 'Unknown manual file after completion also invalidates checks conservatively')
+  local finalreview = e.review(quiet, plan)
+  local unassigned
+  for _, file in ipairs(finalreview.files) do if file.path == 'new_shared.ex' then unassigned = file end end
+  check(unassigned and unassigned.actor == 'human', 'Post-completion manual file remains in review without inventing a step')
+  equal(#finalreview.groups, 2, 'Unassigned human work never creates fake dossier outcomes')
+  local quoted = session()
+  e.observe(quoted, { type = 'tool', name = 'Shell', id = 'echo', step_id = 'admit', status = 'done',
+    text = "echo 'elixir fake_test.exs'\n99 tests, 0 failures\n[exit 0]" })
+  equal(e.summary(quoted, 'admit').tests_passed, 0, 'A runner name quoted in echo cannot become passing test evidence')
+  e.observe(quoted, { type = 'tool', name = 'Shell', id = 'absolute', step_id = 'admit', status = 'done',
+    text = '/opt/homebrew/bin/elixir queue_test.exs\n6 tests, 0 failures\n[exit 0]' })
+  equal(e.summary(quoted, 'admit').tests_passed, 6, 'Absolute runner executable remains recognizable')
+  local before = vim.deepcopy(s)
+  e.summary(s, 'admit'); e.review(s, plan); e.action(s)
+  equal(s, before, 'Rendering and review queries have no state mutation')
+  local unverified = session()
+  unverified.workflow.steps.admit.status = 'done'
+  local pending = e.review(unverified, { steps = { { id = 'admit', title = 'Admission' } } })
+  check(table.concat(pending.unresolved, '\n'):find('no check results recorded', 1, true),
+    'A completed outcome without observed checks remains explicitly unverified')
+end
+local ok, err = xpcall(run, debug.traceback)
+if not ok then io.stderr:write(err .. '\n'); vim.cmd('cquit 1') end
+print('Kiln evidence: ' .. count .. ' assertions passed')
+vim.cmd('qa!')

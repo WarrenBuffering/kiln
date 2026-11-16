@@ -54,6 +54,8 @@ def emit(value, newline=True):
 emit({"type": "session", "id": "test-native-session"})
 emit({"type": "message", "id": "message-1", "role": "assistant", "text": "First"})
 if "slow fixture" in prompt:
+    sys.stdout.write('{"type":'); sys.stdout.flush()
+    pathlib.Path("partial-ready").write_text("ready")
     time.sleep(30)
 if "long output fixture" in prompt:
     emit({"type": "tool", "id": "long-tool", "name": "Shell", "status": "done",
@@ -65,7 +67,7 @@ emit({"type": "done", "ok": True, "exit_code": 0}, False)
   vim.cmd('edit ' .. fn.fnameescape(root .. '/app.py'))
   vim.cmd('set columns=160 lines=50')
   app = require('kiln')
-  app.setup({ root = root })
+  app.setup({ root = root, workflow = false })
   local s = app.state
   equal(#api.nvim_list_wins(), 4, 'layout has code, monitor, transcript, and prompt')
   equal(api.nvim_win_get_width(s.windows.monitor), 40, 'sidebar is one quarter of 160 columns')
@@ -78,7 +80,7 @@ emit({"type": "done", "ok": True, "exit_code": 0}, False)
   app.follow()
   equal(api.nvim_buf_get_lines(s.buffers.prompt, 0, -1, false), { 'Draft line one', 'draft line two' }, 'render preserves prompt text')
   equal(api.nvim_win_get_cursor(s.windows.prompt), { 2, 4 }, 'render preserves prompt cursor')
-  app.new()
+  app.new({ shared = true })
   equal(s.selected, 2, 'new selects new session')
   equal(s.sessions[1].draft, 'Draft line one\ndraft line two', 'new saves previous draft')
   equal(api.nvim_buf_get_lines(s.buffers.prompt, 0, -1, false), { '' }, 'new starts empty draft')
@@ -164,7 +166,9 @@ emit({"type": "done", "ok": True, "exit_code": 0}, False)
   api.nvim_buf_set_lines(s.buffers.prompt, 0, -1, false, { 'slow fixture' })
   app.send()
   check(active.job ~= nil, 'first editing agent starts')
-  app.new()
+  check(vim.wait(5000, function() return fn.filereadable(root .. '/partial-ready') == 1 end, 20),
+    'cancellation fixture has emitted an incomplete protocol record')
+  app.new({ shared = true })
   local second = s.sessions[s.selected]
   api.nvim_buf_set_lines(s.buffers.prompt, 0, -1, false, { 'concurrent edit' })
   app.send()
@@ -187,7 +191,7 @@ emit({"type": "done", "ok": True, "exit_code": 0}, False)
   check(vim.tbl_contains(interactive.args, 'test-native-session'), 'native bridge resumes exact session')
   check(vim.tbl_contains(interactive.args, 'custom-model'), 'native bridge preserves chosen model')
   equal(active.status, 'native', 'monitor distinguishes native session')
-  app.new()
+  app.new({ shared = true })
   local competing = s.sessions[s.selected]
   api.nvim_buf_set_lines(s.buffers.prompt, 0, -1, false, { 'edit during native session' })
   app.send()
@@ -245,6 +249,33 @@ emit({"type": "done", "ok": True, "exit_code": 0}, False)
   api.nvim_exec_autocmds('VimResized', {})
   equal(api.nvim_win_get_width(s.windows.monitor), 24, 'narrow terminal retains minimum sidebar width')
   check(api.nvim_win_get_height(s.windows.prompt) >= 3, 'narrow terminal keeps prompt usable')
+  for _, provider in ipairs({ 'codex', 'claude' }) do
+    active.provider = provider
+    local diagnostic = { type = 'status', text = '2026-11-13T19:23:04Z WARN 界界界 provider: '
+      .. string.rep('transport detail 界 ', 70) .. '\nFinal diagnostic detail' }
+    local failure = { type = 'error', text = string.rep('Actionable failure ', 15) }
+    local explanation = { type = 'message', role = 'assistant', text = string.rep('Meaningful explanation ', 15) }
+    active.events = { { type = 'status', text = 'Working' }, diagnostic, failure, explanation }
+    app.follow()
+    local rendered = api.nvim_buf_get_lines(s.buffers.transcript, 0, -1, false)
+    local diagnostic_row, inspection_row
+    for row, line in ipairs(rendered) do
+      if line == ' PROVIDER DIAGNOSTIC' then diagnostic_row = row end
+      if line == ' [Enter to inspect full output]' then inspection_row = row end
+    end
+    check(vim.tbl_contains(rendered, ' Working'), provider .. ': ordinary status stays visible')
+    check(diagnostic_row and inspection_row == diagnostic_row + 2, provider .. ': diagnostic has one preview line')
+    check(fn.strdisplaywidth(rendered[diagnostic_row + 1]) <= api.nvim_win_get_width(s.windows.transcript),
+      provider .. ': diagnostic preview fits narrow pane, including wide characters')
+    check(vim.tbl_contains(rendered, ' ' .. failure.text), provider .. ': actionable errors remain complete')
+    check(vim.tbl_contains(rendered, ' ' .. explanation.text), provider .. ': explanations remain complete')
+    api.nvim_set_current_win(s.windows.transcript)
+    api.nvim_win_set_cursor(s.windows.transcript, { inspection_row, 0 })
+    fn.maparg('<CR>', 'n', false, true).callback()
+    equal(table.concat(api.nvim_buf_get_lines(0, 0, -1, false), '\n'), diagnostic.text,
+      provider .. ': Enter reveals exact complete diagnostic')
+    fn.maparg('q', 'n', false, true).callback()
+  end
 end
 
 local ok, err = xpcall(run, debug.traceback)

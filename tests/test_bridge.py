@@ -511,5 +511,141 @@ vim.cmd('qa!')
                             pass
 
 
+class WriterLeaseTests(unittest.TestCase):
+    """Real bridge processes; fake providers never contact a model service."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="kiln-writer-leases-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+        self.first = self.root / "first worktree"
+        self.second = self.root / "second worktree"
+        self.first.mkdir()
+        self.second.mkdir()
+        self.script = self.root / "fake-provider"
+        self.script.write_text(f"#!{sys.executable}\n" + '''import json, os, sys, time
+sys.stdin.read()
+ready = os.environ.get("KILN_TEST_LEASE_READY")
+if ready:
+    with open(ready, "w") as stream: stream.write(str(os.getpid()))
+if os.environ.get("KILN_TEST_LEASE_HOLD") == "1": time.sleep(60)
+if "-p" in sys.argv:
+    print(json.dumps({"type":"result", "subtype":"success", "is_error":False, "result":"Done"}))
+else:
+    print(json.dumps({"type":"turn.completed"}))
+''')
+        self.script.chmod(0o755)
+        self.running = []
+        self.addCleanup(self.stop_all)
+
+    def stop_all(self):
+        for process in self.running:
+            if process.poll() is None:
+                process.terminate()
+            try:
+                process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate()
+
+    def command(self, provider, cwd, mode="edit", native=False):
+        command = [sys.executable, str(BRIDGE), "--provider", provider, "--cwd", str(cwd), "--mode", mode]
+        if native:
+            command.append("--interactive")
+        return command
+
+    def environment(self, name, hold=False):
+        return dict(os.environ, KILN_CODEX_BIN=str(self.script), KILN_CLAUDE_BIN=str(self.script),
+                    KILN_STATE_DIR=str(self.root / ("profile-" + name)),
+                    KILN_TEST_LEASE_READY=str(self.root / (name + ".ready")), KILN_TEST_LEASE_HOLD="1" if hold else "0")
+
+    def start(self, name, provider, cwd, mode="edit", native=False):
+        process = subprocess.Popen(self.command(provider, cwd, mode, native), stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                   env=self.environment(name, True))
+        self.running.append(process)
+        process.stdin.write("Inspect this worktree")
+        process.stdin.close()
+        process.stdin = None
+        ready = self.root / (name + ".ready")
+        deadline = time.monotonic() + 5
+        while not ready.exists() and process.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if not ready.exists():
+            output, errors = process.communicate(timeout=5)
+            self.fail("Fake provider did not start: " + output + errors)
+        return process
+
+    def quick(self, name, provider, cwd, mode="edit", native=False):
+        return subprocess.run(self.command(provider, cwd, mode, native), input="Inspect this worktree",
+                              capture_output=True, text=True, timeout=5, env=self.environment(name))
+
+    def test_same_worktree_blocks_other_provider_across_state_profiles_and_symlinks(self):
+        first = self.start("owner", "codex", self.first)
+        alias = self.root / "symlink-to-first"
+        alias.symlink_to(self.first, target_is_directory=True)
+        for provider, cwd in (("claude", self.first), ("codex", alias)):
+            with self.subTest(provider=provider, cwd=cwd):
+                result = self.quick("blocked", provider, cwd)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                events = [json.loads(line) for line in result.stdout.splitlines()]
+                self.assertIn("Another Kiln editing agent", events[0]["text"])
+                self.assertFalse(events[-1]["ok"])
+                self.assertFalse((self.root / "blocked.ready").exists())
+        self.assertIsNone(first.poll())
+
+    def test_different_worktrees_run_codex_and_claude_in_parallel(self):
+        first = self.start("codex", "codex", self.first)
+        second = self.start("claude", "claude", self.second)
+        self.assertIsNone(first.poll())
+        self.assertIsNone(second.poll())
+        self.assertTrue((self.root / "codex.ready").exists())
+        self.assertTrue((self.root / "claude.ready").exists())
+
+    def test_plan_runs_alongside_writer_and_does_not_own_writer_lock(self):
+        first = self.start("builder", "codex", self.first)
+        result = self.quick("reviewer", "claude", self.first, mode="plan")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIsNone(first.poll())
+        reviewer = self.start("plan-owner", "claude", self.second, mode="plan")
+        result = self.quick("second-builder", "codex", self.second)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIsNone(reviewer.poll())
+
+    def test_cancellation_releases_lock_after_provider_cleanup(self):
+        first = self.start("cancel", "codex", self.first)
+        pid = int((self.root / "cancel.ready").read_text())
+        first.terminate()
+        output, errors = first.communicate(timeout=5)
+        self.assertEqual(first.returncode, 130, errors)
+        self.assertTrue(json.loads(output.splitlines()[-1])["cancelled"])
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
+        result = self.quick("replacement", "claude", self.first)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_native_takeover_keeps_lease_across_exec(self):
+        native = self.start("native", "claude", self.first, native=True)
+        result = self.quick("blocked-stream", "codex", self.first)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Another Kiln editing agent", result.stdout)
+        result = self.quick("blocked-native", "claude", self.first, native=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Another Kiln editing agent", result.stderr)
+        native.terminate()
+        native.communicate(timeout=5)
+        result = self.quick("after-native", "codex", self.first)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_failed_provider_start_releases_lease(self):
+        env = self.environment("missing")
+        env["KILN_CODEX_BIN"] = str(self.root / "missing-executable")
+        result = subprocess.run(self.command("codex", self.first), input="Inspect",
+                                capture_output=True, text=True, timeout=5, env=env)
+        self.assertEqual(result.returncode, 1)
+        result = self.quick("after-failure", "claude", self.first)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

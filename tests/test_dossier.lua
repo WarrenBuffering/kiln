@@ -1,0 +1,147 @@
+-- Dossiers require visible rationale, but do not pretend to judge semantic quality.
+local fn = vim.fn
+vim.opt.runtimepath:prepend(vim.env.KILN_HOME or fn.getcwd())
+local dossier = require('kiln.dossier')
+local count = 0
+local function check(value, message) count = count + 1; assert(value, message) end
+local function equal(actual, expected, message)
+  check(vim.deep_equal(actual, expected), message .. '\nactual: ' .. vim.inspect(actual) .. '\nexpected: ' .. vim.inspect(expected))
+end
+local function has(text, value) return tostring(text):find(value, 1, true) ~= nil end
+local brief = '# Priority queue\n\nApproach: Extend the existing Elixir queue and its public tests.\nWhy this approach: Preserve current callers and avoid a second implementation.\n'
+local unit = '## Step queue: Priority ordering\n\nOutcome: Callers receive stable priority ordering.\nWhy: This is the requested user-visible behavior and can be reviewed as one change.\nVerify: Run existing queue tests plus ties and negative priorities.\n\nKeep the existing public API.\n'
+local independent = '## Step docs: Document priority ordering\n\nOutcome: A usage example explains priority and tie behavior.\nWhy: Callers need a concrete contract; the example can be written against the agreed API.\nVerify: Check example names against the existing public API.\n'
+local dependent = '## Step board: Show priority in the board\n\nOutcome: Board rows display each priority value.\nWhy: Operators need to see the ordering rule beside each item.\nVerify: Run board rendering tests against the integrated queue.\nDepends: queue\nDependency reason: Rendering assertions rely on the priority API produced by queue.\n'
+local function parse(text)
+  local result, err = dossier.parse(text)
+  check(result ~= nil, 'Expected valid dossier: ' .. tostring(err))
+  return result
+end
+local function invalid(text, fragment)
+  local plan, err = dossier.parse(text)
+  check(plan == nil, 'Invalid dossier must not produce runnable steps')
+  check(has(err, fragment), 'Actionable error should mention ' .. fragment .. ': ' .. tostring(err))
+end
+local function run()
+  local plan = parse(brief .. '\n' .. unit)
+  equal(#plan.steps, 1, 'One cohesive deliverable is enough; no ceremonial step count')
+  equal(plan.steps[1].depends_on, {}, 'Missing Depends imposes no ordering')
+  equal(plan.steps[1].outcome, 'Callers receive stable priority ordering.', 'Concrete outcome is retained')
+  check(has(plan.steps[1].rationale, 'one change') and has(plan.steps[1].verify, 'ties'), 'Step rationale and validation remain visible')
+  check(has(plan.approach, 'existing Elixir') and has(plan.rationale, 'current callers'), 'Process choice and rationale remain visible')
+  check(#plan.fingerprint == 64 and #plan.steps[1].fingerprint == 64, 'Dossier and deliverable snapshots have deterministic fingerprints')
+  local same = parse((brief .. '\n' .. unit):gsub('\n', '\r\n'))
+  equal(same.fingerprint, plan.fingerprint, 'Line ending differences do not change adopted content identity')
+  equal(parse(dossier.render(plan)).fingerprint, plan.fingerprint, 'Editable Markdown round trip preserves snapshot identity')
+  local revised_brief = parse((brief .. '\n' .. unit):gsub('avoid a second implementation', 'reuse the measured implementation'))
+  check(revised_brief.fingerprint ~= plan.fingerprint, 'A shared-brief edit creates a new plan revision')
+  equal(revised_brief.steps[1].fingerprint, plan.steps[1].fingerprint, 'Shared-brief revisions do not rewrite dispatched deliverable identity')
+  local revised_step = parse((brief .. '\n' .. unit):gsub('negative priorities', 'negative and missing priorities'))
+  check(revised_step.steps[1].fingerprint ~= plan.steps[1].fingerprint, 'A verification change revises the deliverable snapshot')
+  local parallel = parse(brief .. '\n' .. unit .. '\n' .. independent)
+  equal(parallel.steps[2].depends_on, {}, 'Later steps do not silently depend on previous ones')
+  local dependency = parse(brief .. '\n' .. unit .. '\n' .. dependent)
+  equal(dependency.steps[2].depends_on, { 'queue' }, 'Only explicit dependencies impose sequence')
+  check(has(dependency.steps[2].dependency_reason, 'priority API'), 'Dependency reason remains part of the reviewable dossier')
+  local ordered = parse(brief .. '\n' .. dependent .. '\n' .. unit)
+  equal(ordered.steps[1].depends_on, { 'queue' }, 'A justified dependency can refer to a later-declared step')
+  local explicit_none = parse(brief .. '\n' .. unit .. 'Depends: none\n')
+  equal(explicit_none.steps[1].depends_on, {}, 'Explicit none is independent')
+  local assigned = parse(brief .. unit .. 'Provider: claude\nModel: sonnet\n')
+  equal(assigned.steps[1].provider, 'claude', 'A dossier can explicitly assign its provider')
+  equal(assigned.steps[1].model, 'sonnet', 'A dossier can explicitly assign its model')
+  equal(plan.steps[1].provider, nil, 'Absent provider inherits at dispatch rather than inventing an assignment')
+  check(assigned.steps[1].fingerprint ~= plan.steps[1].fingerprint, 'Provider and model assignments are part of the pinned deliverable')
+  equal(parse(dossier.render(assigned)).steps[1].model, 'sonnet', 'Assignments survive the Markdown round trip')
+  invalid(brief .. unit .. 'Provider: unknown\n', 'Provider must be')
+  invalid(brief .. unit .. 'Provider: \n', 'Provider must be')
+  invalid(brief .. unit .. 'Model: \n', 'Model must be')
+  invalid(brief .. unit .. 'Model: bad\tvalue\n', 'Model must be')
+  invalid(brief .. unit .. 'Provider: codex\nProvider: claude\n', 'repeats Provider')
+  invalid(dossier.template(), 'Approach')
+  check(has(dossier.template('Requested feature'), '# Requested feature'), 'Template keeps requested title')
+  invalid('No headings here', '# Dossier title')
+  invalid(brief, 'at least one')
+  invalid(brief .. unit .. '\n# Second title', 'one top-level')
+  invalid(brief .. unit .. '\n## Step queue: Duplicate', 'Duplicate step ID')
+  invalid(brief .. unit:gsub('Step queue: Priority ordering', 'Step queue: '), 'title cannot be empty')
+  invalid(brief .. unit:gsub('Step queue: Priority ordering', 'Step bad/id: Priority ordering'), 'short alphanumeric ID')
+  invalid(brief .. unit:gsub('Outcome: [^\n]+', 'Outcome: '), 'Outcome')
+  invalid(brief .. unit:gsub('Why: [^\n]+', 'Why: '), 'Why')
+  invalid(brief .. unit:gsub('Verify: [^\n]+', ''), 'Verify')
+  invalid((brief .. unit):gsub('Approach: [^\n]+', ''), 'Approach')
+  invalid((brief .. unit):gsub('Why this approach: [^\n]+', ''), 'Why this approach')
+  invalid(brief .. unit .. 'Outcome: Another outcome\n', 'repeats Outcome')
+  invalid(brief .. unit .. 'Depends: queue\nDependency reason: Circular.\n', 'cannot depend on itself')
+  invalid(brief .. unit .. 'Depends: absent\nDependency reason: Needed.\n', 'missing step absent')
+  invalid(brief .. unit .. dependent:gsub('Dependency reason: [^\n]+', ''), 'Dependency reason')
+  invalid(brief .. unit .. dependent:gsub('Depends: queue', 'Depends: queue, queue'), 'repeated dependency queue')
+  invalid(brief .. unit .. dependent:gsub('Depends: queue', 'Depends: queue,'), 'invalid dependency ID')
+  invalid(brief .. unit .. 'Depends: \n', 'Depends must be none')
+  invalid(brief .. unit .. 'Depends: board\nDependency reason: Contract.\n' .. dependent, 'Dependency cycle')
+  local fenced = parse(brief .. unit .. '\n```markdown\n## Step fake: Not a real step\nDepends: ghost\nOutcome: Example only\n```\n')
+  equal(#fenced.steps, 1, 'Markdown examples inside code fences do not create deliverables')
+  equal(fenced.steps[1].depends_on, {}, 'Example dependencies inside fences do not impose execution order')
+  invalid(brief .. unit .. '\n```elixir\ndef foo', 'Close the fenced code block')
+  invalid((brief .. unit):gsub('Outcome: [^\n]+', '```\nOutcome: Example only\n```'), 'Outcome')
+  local comments = parse(brief .. unit .. '\n<!--\n## Step hidden: Never dispatch\nOutcome: Hidden\nWhy: Hidden\nVerify: Hidden\n-->\n')
+  equal(#comments.steps, 1, 'HTML-commented headings never create dispatchable deliverables')
+  check(has(comments.steps[1].instructions, '<!--'), 'Raw instructional comments remain in the editable document')
+  invalid((brief .. unit):gsub('Outcome: [^\n]+', '<!-- Outcome: Hidden -->'), 'Outcome')
+  invalid((brief .. unit):gsub('Why: [^\n]+', '<!--\nWhy: Hidden\n-->'), 'Why')
+  invalid((brief .. unit):gsub('Verify: [^\n]+', '<!-- Verify: Hidden -->'), 'Verify')
+  invalid((brief .. unit):gsub('Approach: [^\n]+', '<!-- Approach: Hidden -->'), 'Approach')
+  invalid((brief .. unit):gsub('Why this approach: [^\n]+', '<!--\nWhy this approach: Hidden\n-->'), 'Why this approach')
+  local inline = parse(brief .. unit .. '<!-- Dependencies discussed earlier -->Depends: none<!-- ignored -->\n')
+  equal(inline.steps[1].depends_on, {}, 'Visible fields beside inline comments remain readable')
+  local literal_comment = parse(brief .. unit .. '\n```html\n<!-- literal unclosed example\n```\n')
+  equal(#literal_comment.steps, 1, 'A comment marker in a code example cannot hide the closing fence')
+  local nested_fence = parse(brief .. unit .. '\n````markdown\n```html\n<!-- literal comment\n```\n## Step fake: Literal example\n````\n')
+  equal(#nested_fence.steps, 1, 'Shorter fences inside a longer example cannot create hidden structural steps')
+
+  local workflow = parse(brief .. '\n' .. unit .. '\n' .. independent .. '\n' .. dependent)
+  local snapshot = vim.deepcopy(workflow)
+  local rows = dossier.readiness(workflow, {})
+  equal(vim.tbl_map(function(row) return row.status end, rows), { 'ready', 'ready', 'pending' }, 'Independent deliverables can run together; real dependency waits')
+  check(rows[1].ready and rows[2].ready and not rows[3].ready, 'Dispatch uses explicit readiness booleans')
+  equal(rows[3].unmet_dependencies, { 'queue' }, 'Waiting state names the actual dependency')
+  equal(workflow, snapshot, 'Readiness does not mutate the adopted dossier')
+  workflow.steps[1].session_id = 'builder'
+  local sessions = { { id = 'builder', provider = 'codex', job = 21, status = 'running' } }
+  rows = dossier.readiness(workflow, sessions)
+  equal(rows[1].status, 'running', 'A real job is active')
+  equal(rows[1].index, 1, 'Assigned task exposes its actionable session index')
+  equal(rows[3].status, 'pending', 'Starting prerequisite does not release dependents')
+  sessions[1].job, sessions[1].status = nil, 'done'
+  rows = dossier.readiness(workflow, sessions)
+  equal(rows[1].status, 'review', 'Provider completion requires user review')
+  check(not rows[1].reviewed and has(rows[1].reason, 'Awaiting'), 'Unreviewed completion is explicit')
+  equal(rows[3].status, 'pending', 'Completed prerequisite alone does not release dependents')
+  sessions[1].reviewed = true
+  rows = dossier.readiness(workflow, sessions)
+  check(rows[1].reviewed and has(rows[1].reason, 'integrate'), 'Reviewed work still waits for integration')
+  equal(rows[3].status, 'pending', 'Review alone does not release dependent worktrees')
+  sessions[1].work_status = 'integrated'
+  rows = dossier.readiness(workflow, sessions)
+  equal(rows[1].status, 'integrated', 'Successful integration completes the prerequisite')
+  equal(rows[3].status, 'ready', 'Dependent work becomes ready only after integration')
+  sessions[1].work_status, sessions[1].status, sessions[1].reviewed = nil, 'running', false
+  equal(dossier.readiness(workflow, sessions)[1].status, 'blocked', 'Persisted running text without a live process is interrupted')
+  sessions[1].status, sessions[1].native_job = 'native', 22
+  equal(dossier.readiness(workflow, sessions)[1].status, 'running', 'Native provider work is active too')
+  sessions[1].native_job, sessions[1].operation = nil, {}
+  equal(dossier.readiness(workflow, sessions)[1].status, 'running', 'Workspace operations prevent duplicate dispatch')
+  sessions[1].operation, sessions[1].status, sessions[1].human_control = nil, 'stopped', true
+  check(has(dossier.readiness(workflow, sessions)[1].reason, 'handcoding'), 'Manual control is shown as waiting for the user')
+  sessions[1].human_control, sessions[1].work_status = false, 'missing'
+  equal(dossier.readiness(workflow, sessions)[1].status, 'blocked', 'Missing task worktree is not silently redispatched')
+  sessions[1].work_status, sessions[1].status = nil, 'idle'
+  rows = dossier.readiness(workflow, sessions)
+  check(not rows[1].ready and has(rows[1].reason, 'existing worktree'), 'An idle assigned task cannot create duplicate work on dispatch')
+  equal(dossier.readiness(workflow, {})[1].status, 'blocked', 'Missing bound session is reported instead of creating duplicate work')
+end
+
+local ok, err = xpcall(run, debug.traceback)
+if not ok then io.stderr:write(err .. '\n'); vim.cmd('cquit 1') end
+print('Kiln dossier: ' .. count .. ' assertions passed')
+vim.cmd('qa!')

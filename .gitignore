@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 .DS_Store
 .nvimlog
+# Local captures and generated showcase media are not source artifacts.
+docs/*.mp4
+docs/*-poster.png

@@ -125,7 +125,7 @@ else:
   vim.env.KILN_CODEX_BIN, vim.env.KILN_CLAUDE_BIN = fake, fake
   vim.cmd('edit ' .. fn.fnameescape(root .. '/app.py'))
   app = require('kiln')
-  app.setup({ root = root })
+  app.setup({ root = root, workflow = false })
   local state = app.state
   local codex = state.sessions[state.selected]
   check(state.follow, 'Live follow is enabled by default')

@@ -3,6 +3,7 @@ vim.o.swapfile, vim.o.backup, vim.o.writebackup, vim.o.modeline = false, false, 
 local changes = require('kiln.changes')
 local root = vim.fn.tempname() .. '-kiln-changes'
 local assertions = 0
+local instances, temporary_roots = {}, {}
 local function check(value, message)
   assertions = assertions + 1
   assert(value, message)
@@ -165,9 +166,166 @@ local function test()
   check(not changes.show_diff('file.txt', code_win), 'Non-Git diff fails gracefully')
   changes.stop()
   vim.fn.delete(nongit, 'rf')
+
+  -- Concurrent tasks review their own fixed baseline, including commits an
+  -- agent made before the human selected the task.
+  vim.cmd('only')
+  local task_a, task_b = root .. '-task a', root .. '-task b'
+  temporary_roots = { task_a, task_b }
+  local base = vim.trim(git('rev-parse', 'HEAD'))
+  git('worktree', 'add', '-b', 'kiln/task-a', task_a, 'HEAD')
+  git('worktree', 'add', '-b', 'kiln/task-b', task_b, 'HEAD')
+  local function task_git(path, ...)
+    local cmd = { 'git', '-C', path }
+    vim.list_extend(cmd, { ... })
+    local result = vim.system(cmd, { text = true }):wait()
+    assert(result.code == 0, result.stderr)
+    return result.stdout
+  end
+  vim.fn.writefile({ 'task A committed', 'two', 'three' }, task_a .. '/base.txt')
+  task_git(task_a, 'mv', 'old name.txt', 'renamed by A.txt')
+  task_git(task_a, 'rm', 'gone.txt')
+  vim.fn.writefile({ 'new committed file' }, task_a .. '/added by A.txt')
+  task_git(task_a, 'add', '-A')
+  task_git(task_a, 'commit', '-m', 'Task A fixture')
+  vim.fn.writefile({ 'task A current', 'two', 'three' }, task_a .. '/base.txt')
+  vim.fn.writefile({ 'task A untracked' }, task_a .. '/-untracked.txt')
+  vim.fn.writefile({ 'task B committed', 'two', 'three' }, task_b .. '/base.txt')
+  task_git(task_b, 'add', '-A')
+  task_git(task_b, 'commit', '-m', 'Task B fixture')
+  local a, b = changes.new(), changes.new()
+  instances = { a, b }
+  local a_updates, b_updates, a_conflicts, task_errors = 0, 0, 0, {}
+  a.setup({ root = task_a, base = base, interval = 10000,
+    on_update = function() a_updates = a_updates + 1 end,
+    on_conflict = function() a_conflicts = a_conflicts + 1 end,
+    on_error = function(message) task_errors[#task_errors + 1] = message end })
+  b.setup({ root = task_b, base = base, interval = 10000,
+    on_update = function() b_updates = b_updates + 1 end,
+    on_error = function(message) task_errors[#task_errors + 1] = message end })
+  wait_for(function() return a_updates > 0 and b_updates > 0 end, 'Independent task scans complete')
+  local a_files, b_files = {}, {}
+  for _, entry in ipairs(a.list()) do a_files[entry.path] = entry end
+  for _, entry in ipairs(b.list()) do b_files[entry.path] = entry end
+  check(a_files['base.txt'] ~= nil and b_files['base.txt'] ~= nil, 'Both tasks retain same-name changes from their own roots')
+  check(a_files['added by A.txt'].base_absent == true, 'Committed addition remains new against task baseline')
+  check(a_files['renamed by A.txt'].old_path == 'old name.txt', 'Committed rename retains original baseline path')
+  check(a_files['gone.txt'].status:find('D') ~= nil, 'Committed deletion remains reviewable')
+  check(a_files['-untracked.txt'].status == '??', 'Fixed baseline includes current untracked files')
+  check(b_files['added by A.txt'] == nil and #b.list() == 1, 'Task changes never leak between worktrees')
+
+  local a_win = vim.api.nvim_get_current_win()
+  vim.api.nvim_win_set_buf(a_win, vim.api.nvim_create_buf(true, false))
+  vim.cmd('vsplit')
+  local b_win = vim.api.nvim_get_current_win()
+  vim.api.nvim_win_set_buf(b_win, vim.api.nvim_create_buf(true, false))
+  vim.cmd('botright vsplit')
+  local focus_win = vim.api.nvim_get_current_win()
+  vim.api.nvim_win_set_buf(focus_win, vim.api.nvim_create_buf(false, true))
+  check(a.show_diff('base.txt', a_win) and b.show_diff('base.txt', b_win), 'Two independent task diffs start')
+  wait_for(function() return a.is_diff_open() and b.is_diff_open() end, 'Independent task diffs open together')
+  local a_buf, b_buf = vim.api.nvim_win_get_buf(a_win), vim.api.nvim_win_get_buf(b_win)
+  check(a_buf ~= b_buf, 'Same filename in different worktrees uses distinct editor buffers')
+  check(vim.api.nvim_buf_get_lines(a_buf, 0, 1, false)[1] == 'task A current', 'Task A shows its current code')
+  check(vim.api.nvim_buf_get_lines(b_buf, 0, 1, false)[1] == 'task B committed', 'Task B shows its own committed code')
+  local baseline_count = 0
+  for _, win in ipairs(vim.api.nvim_list_wins()) do
+    if vim.wo[win].winbar:find('BASE', 1, true) then
+      baseline_count = baseline_count + 1
+      check(vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(win), 0, 1, false)[1] == 'one',
+        'Task diff uses original base, not agent commit HEAD')
+    end
+  end
+  check(baseline_count == 2, 'Both fixed baselines have explicit BASE labels')
+  check(vim.api.nvim_get_current_win() == focus_win, 'Concurrent diff updates preserve focus')
+  check(not a.show_diff('base.txt', b_win), 'Another task cannot take over an owned diff window')
+  check(b.is_diff_open(), 'Rejected takeover preserves the existing task diff')
+  a.close_diff()
+  check(b.is_diff_open() and vim.wo[b_win].diff, 'Closing one instance leaves the other diff intact')
+  check(a.show_diff('renamed by A.txt', a_win), 'Fixed-base rename diff starts')
+  wait_for(a.is_diff_open, 'Fixed-base rename diff opens')
+  local found_rename = false
+  for _, win in ipairs(vim.api.nvim_list_wins()) do
+    if vim.wo[win].winbar:find('renamed by A.txt', 1, true) and vim.wo[win].winbar:find('BASE', 1, true) then
+      found_rename = vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(win), 0, 1, false)[1] == 'rename me'
+    end
+  end
+  check(found_rename, 'Committed rename reads original baseline contents')
+  a.close_diff()
+  check(a.show_diff('added by A.txt', a_win), 'Committed new-file diff starts')
+  wait_for(a.is_diff_open, 'Committed new-file diff uses empty baseline')
+  a.close_diff()
+  check(a.show_diff('gone.txt', a_win), 'Committed deletion diff starts')
+  wait_for(a.is_diff_open, 'Committed deletion diff opens')
+  a.close_diff()
+
+  -- A slow Git response from the previous task must not reopen its view after
+  -- the user has switched tasks. close_diff cancels pending opens too.
+  check(a.show_diff('base.txt', a_win), 'Pending diff starts before switch')
+  a.close_diff()
+  vim.wait(150, function() return false end, 10)
+  check(not a.is_diff_open(), 'Canceled asynchronous task diff does not reopen')
+  check(b.is_diff_open(), 'Canceling task A does not cancel task B')
+  check(a.follow('base.txt', a_win), 'Task A can return to its file')
+  vim.api.nvim_buf_set_lines(a_buf, 0, 1, false, { 'human unsaved A' })
+  vim.api.nvim_win_set_buf(a_win, vim.api.nvim_create_buf(true, false))
+  vim.fn.writefile({ 'agent writes A while hidden' }, task_a .. '/base.txt')
+  a.scan()
+  check(vim.api.nvim_buf_get_lines(a_buf, 0, 1, false)[1] == 'human unsaved A', 'Hidden human edits survive background task writes')
+  check(a_conflicts == 1, 'Hidden-buffer conflict is attributed to its task')
+  check(not a.follow('base.txt', a_win), 'Task follow cannot replace hidden unsaved changes')
+  vim.bo[a_buf].modified = false
+  a.stop()
+  check(b.is_diff_open(), 'Stopping one watcher leaves another task live')
+  local previous = b_updates
+  b.scan()
+  wait_for(function() return b_updates > previous end, 'Remaining task still receives updates')
+  check(#task_errors == 2 and task_errors[1]:find('other task diff', 1, true)
+      and task_errors[2]:find('unsaved', 1, true), 'Only expected ownership and dirty-buffer guards are reported')
+  b.stop()
+  local groups = vim.api.nvim_get_autocmds({ event = 'BufWritePost' })
+  local leaked = false
+  for _, autocmd in ipairs(groups) do
+    if autocmd.group_name and autocmd.group_name:match('^KilnChanges') then leaked = true end
+  end
+  check(not leaked, 'All stopped watchers remove their independent autocommand groups')
+
+  local invalid_updates = 0
+  a.setup({ root = task_a, base = '--invalid', interval = 10000,
+    on_update = function() invalid_updates = invalid_updates + 1 end,
+    on_error = function() end })
+  check(not a.show_diff('base.txt', a_win), 'Invalid task baseline refuses misleading HEAD fallback')
+  vim.wait(100, function() return false end, 10)
+  check(invalid_updates == 0, 'Invalid baseline never publishes unrelated changes')
+  a.stop()
+
+  -- A state directory may live inside the main checkout. The longest-root
+  -- owner must be the only watcher that reloads or reports its loaded buffers.
+  local nested_root = root .. '/nested-task'
+  vim.fn.mkdir(nested_root, 'p')
+  nested_root = (vim.uv or vim.loop).fs_realpath(nested_root)
+  vim.fn.writefile({ 'original nested content' }, nested_root .. '/owned.ex')
+  local nested_buf = vim.fn.bufadd(nested_root .. '/owned.ex')
+  vim.fn.bufload(nested_buf)
+  local outer_conflicts, inner_conflicts = 0, 0
+  a.setup({ root = root, interval = 10000,
+    owns_path = function(path) return path:sub(1, #nested_root + 1) ~= nested_root .. '/' end,
+    on_conflict = function() outer_conflicts = outer_conflicts + 1 end })
+  b.setup({ root = nested_root, interval = 10000,
+    on_conflict = function() inner_conflicts = inner_conflicts + 1 end })
+  vim.api.nvim_buf_set_lines(nested_buf, 0, -1, false, { 'unsaved nested human edit' })
+  vim.fn.writefile({ 'external nested write' }, nested_root .. '/owned.ex')
+  a.scan(); b.scan()
+  check(outer_conflicts == 0 and inner_conflicts == 1, 'Nested dirty-buffer conflict belongs only to the longest-root watcher')
+  check(vim.api.nvim_buf_get_lines(nested_buf, 0, 1, false)[1] == 'unsaved nested human edit',
+    'Parent watcher cannot replace nested task human edits')
+  vim.bo[nested_buf].modified = false
+  a.stop(); b.stop()
 end
 local ok, err = xpcall(test, debug.traceback)
 changes.stop()
+for _, instance in ipairs(instances) do instance.stop() end
+for _, path in ipairs(temporary_roots) do vim.fn.delete(path, 'rf') end
 vim.fn.delete(root, 'rf')
 if not ok then
   io.stderr:write(err .. '\n')
